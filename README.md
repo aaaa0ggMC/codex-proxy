@@ -8,6 +8,24 @@ OpenAI-compatible client -> http://127.0.0.1:6769/v1 -> ChatGPT Codex backend
 
 This is a compatibility adapter, not a transparent OpenAI proxy. The Codex backend currently requires streaming upstream requests and rejects some common OpenAI parameters, so `codex-proxy` normalizes requests before forwarding them.
 
+## Upstream
+
+This repository is a fork of [Max-Leopold/codex-proxy](https://github.com/Max-Leopold/codex-proxy),
+and the fork relationship is kept so the original work stays visible. Everything up to and
+including commit `942ee9f` is Max Leopold's; the original author and copyright are recorded in
+[LICENSE](LICENSE).
+
+Changes on top of upstream, all in the maintenance of this fork:
+
+- `GET /v1/usage` reports the Codex quota windows, with a cached lookup that never delays a chat request.
+- `--web-search` / `CODEX_PROXY_WEB_SEARCH` force the web search tool on every request.
+- A wider `chat/completions` → Responses compatibility translation, with tests for the translator.
+- Termux-friendly install and build notes, with the installer pointed at this fork.
+
+Bug reports against upstream behaviour are best checked against
+[Max-Leopold/codex-proxy](https://github.com/Max-Leopold/codex-proxy) first, since that is where the
+adapter's original design comes from.
+
 ## Requirements
 
 - Codex CLI authenticated with ChatGPT:
@@ -23,16 +41,16 @@ codex login
 macOS/Linux users can install the latest main build directly:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/aaaa0ggMC/cdxp-termux/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/aaaa0ggMC/codex-proxy/main/scripts/install.sh | bash
 ```
 
 By default this installs to `/usr/local/bin`. To install somewhere else:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/aaaa0ggMC/cdxp-termux/main/scripts/install.sh | INSTALL_DIR="$HOME/.local/bin" bash
+curl -fsSL https://raw.githubusercontent.com/aaaa0ggMC/codex-proxy/main/scripts/install.sh | INSTALL_DIR="$HOME/.local/bin" bash
 ```
 
-Downloadable binaries for macOS, Linux, and Windows are published on the [GitHub Releases page](https://github.com/aaaa0ggMC/cdxp-termux/releases).
+Downloadable binaries for macOS, Linux, and Windows are published on the [GitHub Releases page](https://github.com/aaaa0ggMC/codex-proxy/releases).
 
 ### Android / Termux
 
@@ -41,15 +59,15 @@ Termux. Termux sets `PREFIX`, and the installer already prefers it, so the defau
 installs to `$PREFIX/bin` where the shell can find it:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/aaaa0ggMC/cdxp-termux/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/aaaa0ggMC/codex-proxy/main/scripts/install.sh | bash
 ```
 
 Building from source on device also works:
 
 ```bash
 pkg install golang
-git clone https://github.com/aaaa0ggMC/cdxp-termux.git
-cd cdxp-termux && go build -o "$PREFIX/bin/codex-proxy" .
+git clone https://github.com/aaaa0ggMC/codex-proxy.git
+cd codex-proxy && go build -o "$PREFIX/bin/codex-proxy" .
 ```
 
 Nothing here is Termux-specific: the same flags, environment variables, and routes behave
