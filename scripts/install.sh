@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-repo="${REPO:-Max-Leopold/codex-proxy}"
+repo="${REPO:-aaaa0ggMC/cdxp-termux}"
 binary="codex-proxy"
 install_dir="${INSTALL_DIR:-${PREFIX:-/usr/local}/bin}"
 version="${VERSION:-latest}"

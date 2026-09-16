@@ -39,7 +39,7 @@ type OpenAIResponse struct {
 }
 
 func openAIModelsResponse(models []CodexModel) map[string]any {
-	data := make([]any, 0, len(models))
+	data := make([]any, 0, len(models)*3)
 	for _, model := range models {
 		if !model.SupportedInAPI || model.Visibility != "list" {
 			continue
@@ -50,7 +50,26 @@ func openAIModelsResponse(models []CodexModel) map[string]any {
 			"created":  0,
 			"owned_by": "openai-codex",
 		})
+		data = append(data, map[string]any{
+			"id":       model.Slug + "-search",
+			"object":   "model",
+			"created":  0,
+			"owned_by": "openai-codex",
+		})
+		data = append(data, map[string]any{
+			"id":       model.Slug + "-search-preview",
+			"object":   "model",
+			"created":  0,
+			"owned_by": "openai-codex",
+		})
 	}
+	// Compatibility alias for common client defaults
+	data = append(data, map[string]any{
+		"id":       "gpt-4o-search-preview",
+		"object":   "model",
+		"created":  0,
+		"owned_by": "openai-codex",
+	})
 	return map[string]any{"object": "list", "data": data}
 }
 
@@ -200,7 +219,7 @@ func ChatCompletionFromAggregate(agg OpenAIResponse, model string) map[string]an
 		"role":        "assistant",
 		"content":     agg.OutputText,
 		"refusal":     nil,
-		"annotations": []any{},
+		"annotations": chatAnnotationsFromOutput(agg.Output),
 	}
 	if len(toolCalls) > 0 {
 		finishReason = "tool_calls"
@@ -291,6 +310,30 @@ func chatToolCallsFromOutput(output []any) []any {
 		})
 	}
 	return toolCalls
+}
+
+func chatAnnotationsFromOutput(output []any) []any {
+	var annotations []any
+	for _, item := range output {
+		m, ok := item.(map[string]any)
+		if !ok || stringValue(m, "type") != "message" {
+			continue
+		}
+		content, _ := m["content"].([]any)
+		for _, part := range content {
+			pm, ok := part.(map[string]any)
+			if !ok {
+				continue
+			}
+			if annList, ok := pm["annotations"].([]any); ok && len(annList) > 0 {
+				annotations = append(annotations, annList...)
+			}
+		}
+	}
+	if annotations == nil {
+		return []any{}
+	}
+	return annotations
 }
 
 func outputTextFromItems(output []any) string {

@@ -10,11 +10,13 @@ import (
 
 const defaultInstructions = "You are a helpful assistant."
 
-func NormalizeResponsesRequest(raw map[string]any) (map[string]any, bool, error) {
+func NormalizeResponsesRequest(raw map[string]any, opts ...bool) (map[string]any, bool, error) {
 	model := stringValue(raw, "model")
 	if model == "" {
 		return nil, false, errors.New("missing required field: model")
 	}
+	upstreamModel, modelWantsSearch := resolveModel(model)
+
 	input, ok := raw["input"]
 	if !ok {
 		return nil, false, errors.New("missing required field: input")
@@ -26,17 +28,59 @@ func NormalizeResponsesRequest(raw map[string]any) (map[string]any, bool, error)
 
 	stream := boolValue(raw, "stream")
 	out := map[string]any{
-		"model":        model,
+		"model":        upstreamModel,
 		"input":        normalizedInput,
 		"instructions": defaultedString(raw, "instructions", defaultInstructions),
 		"store":        false,
 		"stream":       true,
 	}
-	for _, key := range []string{"reasoning", "tools", "text", "tool_choice", "parallel_tool_calls"} {
+	for _, key := range []string{"reasoning", "text", "parallel_tool_calls"} {
 		if v, ok := raw[key]; ok {
 			out[key] = v
 		}
 	}
+
+	defaultWebSearch := len(opts) > 0 && opts[0]
+	wantsSearch, searchOpts := extractWebSearchIntent(raw, defaultWebSearch, modelWantsSearch)
+
+	var tools []any
+	if toolsRaw, ok := raw["tools"].([]any); ok {
+		tools = make([]any, 0, len(toolsRaw))
+		for _, item := range toolsRaw {
+			if m, ok := item.(map[string]any); ok {
+				typ := stringValue(m, "type")
+				if typ == "web_search" || typ == "web_search_preview" {
+					tools = append(tools, normalizeWebSearchTool(m))
+					continue
+				}
+			}
+			tools = append(tools, item)
+		}
+	}
+	if wantsSearch {
+		tools = mergeWebSearchTool(tools, searchOpts)
+	}
+	if len(tools) > 0 {
+		out["tools"] = tools
+	}
+
+	if tc, ok := raw["tool_choice"]; ok {
+		if tcMap, isMap := tc.(map[string]any); isMap {
+			if stringValue(tcMap, "type") == "web_search_preview" {
+				tcCopy := make(map[string]any, len(tcMap))
+				for k, v := range tcMap {
+					tcCopy[k] = v
+				}
+				tcCopy["type"] = "web_search"
+				out["tool_choice"] = tcCopy
+			} else {
+				out["tool_choice"] = tc
+			}
+		} else {
+			out["tool_choice"] = tc
+		}
+	}
+
 	return out, stream, nil
 }
 
@@ -53,11 +97,13 @@ func normalizeResponsesInput(input any) ([]any, error) {
 	}
 }
 
-func BuildResponsesRequestFromChat(raw map[string]any) (map[string]any, bool, error) {
+func BuildResponsesRequestFromChat(raw map[string]any, opts ...bool) (map[string]any, bool, error) {
 	model := stringValue(raw, "model")
 	if model == "" {
 		return nil, false, errors.New("missing required field: model")
 	}
+	upstreamModel, modelWantsSearch := resolveModel(model)
+
 	messages, ok := raw["messages"].([]any)
 	if !ok || len(messages) == 0 {
 		return nil, false, errors.New("missing required field: messages")
@@ -108,7 +154,7 @@ func BuildResponsesRequestFromChat(raw map[string]any) (map[string]any, bool, er
 	}
 
 	out := map[string]any{
-		"model":        model,
+		"model":        upstreamModel,
 		"input":        input,
 		"instructions": defaultInstructions,
 		"store":        false,
@@ -117,7 +163,15 @@ func BuildResponsesRequestFromChat(raw map[string]any) (map[string]any, bool, er
 	if len(instructions) > 0 {
 		out["instructions"] = strings.Join(instructions, "\n\n")
 	}
-	if tools := responsesToolsFromChat(raw["tools"]); len(tools) > 0 {
+
+	defaultWebSearch := len(opts) > 0 && opts[0]
+	wantsSearch, searchOpts := extractWebSearchIntent(raw, defaultWebSearch, modelWantsSearch)
+
+	tools := responsesToolsFromChat(raw["tools"])
+	if wantsSearch {
+		tools = mergeWebSearchTool(tools, searchOpts)
+	}
+	if len(tools) > 0 {
 		out["tools"] = tools
 	}
 	if toolChoice, ok, err := responsesToolChoiceFromChat(raw["tool_choice"]); err != nil {
@@ -248,18 +302,23 @@ func responsesToolChoiceFromChat(value any) (any, bool, error) {
 			return nil, false, fmt.Errorf("unsupported tool_choice %q", v)
 		}
 	case map[string]any:
-		if stringValue(v, "type") != "function" {
-			return nil, false, fmt.Errorf("unsupported tool_choice type %q", stringValue(v, "type"))
+		typ := stringValue(v, "type")
+		switch typ {
+		case "function":
+			name := stringValue(v, "name")
+			if name == "" {
+				fn, _ := v["function"].(map[string]any)
+				name = stringValue(fn, "name")
+			}
+			if name == "" {
+				return nil, false, errors.New("function tool_choice is missing a function name")
+			}
+			return map[string]any{"type": "function", "name": name}, true, nil
+		case "web_search", "web_search_preview":
+			return map[string]any{"type": "web_search"}, true, nil
+		default:
+			return nil, false, fmt.Errorf("unsupported tool_choice type %q", typ)
 		}
-		name := stringValue(v, "name")
-		if name == "" {
-			fn, _ := v["function"].(map[string]any)
-			name = stringValue(fn, "name")
-		}
-		if name == "" {
-			return nil, false, errors.New("function tool_choice is missing a function name")
-		}
-		return map[string]any{"type": "function", "name": name}, true, nil
 	default:
 		return nil, false, errors.New("tool_choice must be a string or object")
 	}
@@ -305,28 +364,172 @@ func responsesToolsFromChat(value any) []any {
 	tools := make([]any, 0, len(items))
 	for _, item := range items {
 		m, ok := item.(map[string]any)
-		if !ok || stringValue(m, "type") != "function" {
+		if !ok {
 			continue
 		}
-		fn, ok := m["function"].(map[string]any)
-		if !ok || stringValue(fn, "name") == "" {
-			continue
+		switch stringValue(m, "type") {
+		case "function":
+			fn, ok := m["function"].(map[string]any)
+			if !ok || stringValue(fn, "name") == "" {
+				continue
+			}
+			tool := map[string]any{
+				"type":        "function",
+				"name":        stringValue(fn, "name"),
+				"description": stringValue(fn, "description"),
+				"parameters":  map[string]any{"type": "object", "properties": map[string]any{}},
+			}
+			if params, ok := fn["parameters"]; ok {
+				tool["parameters"] = params
+			}
+			if strict, ok := fn["strict"].(bool); ok {
+				tool["strict"] = strict
+			}
+			tools = append(tools, tool)
+		case "web_search", "web_search_preview":
+			tools = append(tools, normalizeWebSearchTool(m))
 		}
-		tool := map[string]any{
-			"type":        "function",
-			"name":        stringValue(fn, "name"),
-			"description": stringValue(fn, "description"),
-			"parameters":  map[string]any{"type": "object", "properties": map[string]any{}},
-		}
-		if params, ok := fn["parameters"]; ok {
-			tool["parameters"] = params
-		}
-		if strict, ok := fn["strict"].(bool); ok {
-			tool["strict"] = strict
-		}
-		tools = append(tools, tool)
 	}
 	return tools
+}
+
+func resolveModel(model string) (string, bool) {
+	lower := strings.ToLower(model)
+	if strings.HasSuffix(lower, "-search-preview") {
+		base := model[:len(model)-len("-search-preview")]
+		return mapBaseModel(base), true
+	}
+	if strings.HasSuffix(lower, "-search") {
+		base := model[:len(model)-len("-search")]
+		return mapBaseModel(base), true
+	}
+	return model, false
+}
+
+func mapBaseModel(base string) string {
+	lower := strings.ToLower(base)
+	if lower == "gpt-4o" || lower == "gpt-4o-mini" {
+		return "gpt-5.5"
+	}
+	return base
+}
+
+func normalizeWebSearchTool(m map[string]any) map[string]any {
+	tool := map[string]any{
+		"type": "web_search",
+	}
+	copyOption := func(src map[string]any, key string) {
+		if v, ok := src[key]; ok && v != nil {
+			tool[key] = v
+		}
+	}
+	for _, k := range []string{"search_context_size", "user_location", "return_token_budget", "search_content_types"} {
+		copyOption(m, k)
+	}
+	for _, subKey := range []string{"web_search", "web_search_preview"} {
+		if sub, ok := m[subKey].(map[string]any); ok {
+			for _, k := range []string{"search_context_size", "user_location", "return_token_budget", "search_content_types"} {
+				copyOption(sub, k)
+			}
+		}
+	}
+	if loc, ok := tool["user_location"].(map[string]any); ok {
+		if stringValue(loc, "type") == "" {
+			loc["type"] = "approximate"
+		}
+	}
+	return tool
+}
+
+func extractWebSearchIntent(raw map[string]any, defaultWebSearch, modelWantsSearch bool) (bool, map[string]any) {
+	if v, ok := raw["web_search_options"].(bool); ok && !v {
+		return false, nil
+	}
+
+	searchOpts := make(map[string]any)
+	hasIntent := defaultWebSearch || modelWantsSearch
+
+	if opts, ok := raw["web_search_options"].(map[string]any); ok {
+		hasIntent = true
+		for k, v := range opts {
+			searchOpts[k] = v
+		}
+	} else if v, ok := raw["web_search_options"].(bool); ok && v {
+		hasIntent = true
+	}
+
+	if tc, ok := raw["tool_choice"].(map[string]any); ok {
+		typ := stringValue(tc, "type")
+		if typ == "web_search" || typ == "web_search_preview" {
+			hasIntent = true
+		}
+	}
+
+	if toolsRaw, ok := raw["tools"].([]any); ok {
+		for _, item := range toolsRaw {
+			if m, ok := item.(map[string]any); ok {
+				typ := stringValue(m, "type")
+				if typ == "web_search" || typ == "web_search_preview" {
+					hasIntent = true
+					for _, k := range []string{"search_context_size", "user_location", "return_token_budget", "search_content_types"} {
+						if v, ok := m[k]; ok && v != nil {
+							searchOpts[k] = v
+						}
+					}
+					for _, subKey := range []string{"web_search", "web_search_preview"} {
+						if sub, ok := m[subKey].(map[string]any); ok {
+							for _, k := range []string{"search_context_size", "user_location", "return_token_budget", "search_content_types"} {
+								if v, ok := sub[k]; ok && v != nil {
+									searchOpts[k] = v
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	return hasIntent, searchOpts
+}
+
+func hasWebSearchTool(tools []any) bool {
+	for _, item := range tools {
+		if m, ok := item.(map[string]any); ok && stringValue(m, "type") == "web_search" {
+			return true
+		}
+	}
+	return false
+}
+
+func mergeWebSearchTool(tools []any, searchOpts map[string]any) []any {
+	found := false
+	for i, item := range tools {
+		if m, ok := item.(map[string]any); ok && stringValue(m, "type") == "web_search" {
+			found = true
+			tools[i] = mergeSearchOptions(m, searchOpts)
+			break
+		}
+	}
+	if !found {
+		tools = append(tools, normalizeWebSearchTool(searchOpts))
+	}
+	return tools
+}
+
+func mergeSearchOptions(existing, searchOpts map[string]any) map[string]any {
+	out := make(map[string]any, len(existing)+len(searchOpts))
+	for k, v := range existing {
+		out[k] = v
+	}
+	for _, k := range []string{"search_context_size", "user_location", "return_token_budget", "search_content_types"} {
+		if v, ok := searchOpts[k]; ok && v != nil {
+			if _, exists := out[k]; !exists {
+				out[k] = v
+			}
+		}
+	}
+	return normalizeWebSearchTool(out)
 }
 
 func stringValue(m map[string]any, key string) string {

@@ -9,23 +9,32 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
 type Server struct {
-	codex  *CodexClient
-	log    *slog.Logger
-	apiKey string
+	codex     *CodexClient
+	log       *slog.Logger
+	apiKey    string
+	webSearch bool
+
+	usageTTL     time.Duration
+	usageMu      sync.Mutex
+	usageCache   *UsageReport
+	usageCacheAt time.Time
 }
 
 func (s *Server) Routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", s.handleHealth)
 	mux.HandleFunc("GET /v1/models", s.handleModels)
+	mux.HandleFunc("GET /v1/usage", s.handleUsage)
 	mux.HandleFunc("POST /v1/responses", s.handleResponses)
 	mux.HandleFunc("POST /v1/chat/completions", s.handleChatCompletions)
-	return s.logRequests(s.requireAPIKey(mux))
+	return s.logRequests(s.withUsageHeaders(s.requireAPIKey(mux)))
 }
 
 func (s *Server) requireAPIKey(next http.Handler) http.Handler {
@@ -115,13 +124,81 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, openAIModelsResponse(models))
 }
 
+// withUsageHeaders labels every response with the last known quota. It never triggers a fetch:
+// a chat request must not wait on the usage endpoint. Clients that only have room for one value
+// can read X-Codex-Usage-Remaining instead of polling /v1/usage.
+func (s *Server) withUsageHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		s.usageMu.Lock()
+		report := s.usageCache
+		s.usageMu.Unlock()
+		if report != nil {
+			for header, window := range map[string]string{
+				"X-Codex-Usage-Remaining": "tightest",
+				"X-Codex-Usage-5h":        "five_hour",
+				"X-Codex-Usage-Weekly":    "weekly",
+			} {
+				if value, ok := usageValue(report, window); ok {
+					w.Header().Set(header, strconv.FormatFloat(value, 'f', -1, 64))
+				}
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// handleUsage reports the remaining Codex quota (the 5 hour window and the weekly one).
+//
+//	GET /v1/usage                    full JSON report (default); bind remaining_percent, or
+//	                                 five_hour_remaining_percent / weekly_remaining_percent
+//	GET /v1/usage?format=text        one line: "5h 100% · 7d 6%"
+//	GET /v1/usage?format=number      one number: remaining percent, tightest window by default
+//	                                 (?window=five_hour|weekly|tightest picks another one)
+//
+// ?refresh=1 bypasses the cache.
+func (s *Server) handleUsage(w http.ResponseWriter, r *http.Request) {
+	query := r.URL.Query()
+	format := strings.ToLower(strings.TrimSpace(query.Get("format")))
+	if format == "" {
+		format = "json"
+	}
+	refresh := query.Get("refresh") != ""
+	window := strings.ToLower(strings.TrimSpace(query.Get("window")))
+
+	report, err := s.usageReport(r.Context(), refresh)
+	if err != nil {
+		if report == nil {
+			writeOpenAIError(w, http.StatusBadGateway, err.Error())
+			return
+		}
+		s.log.Warn("usage refresh failed; serving the last known report", "error", err.Error())
+	}
+
+	w.Header().Set("Cache-Control", "no-store")
+	switch format {
+	case "json":
+		writeJSON(w, http.StatusOK, report)
+	case "text", "plain":
+		writeText(w, usageText(report))
+	case "number", "value", "percent":
+		value, ok := usageValue(report, window)
+		if !ok {
+			writeOpenAIError(w, http.StatusBadGateway, fmt.Sprintf("no usage window matches %q", window))
+			return
+		}
+		writeText(w, strconv.FormatFloat(value, 'f', -1, 64))
+	default:
+		writeOpenAIError(w, http.StatusBadRequest, fmt.Sprintf("unsupported format %q; use json, text or number", format))
+	}
+}
+
 func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 	raw, err := decodeJSONMap(r)
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	upstream, stream, err := NormalizeResponsesRequest(raw)
+	upstream, stream, err := NormalizeResponsesRequest(raw, s.webSearch)
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, err.Error())
 		return
@@ -144,7 +221,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	upstream, stream, err := BuildResponsesRequestFromChat(raw)
+	upstream, stream, err := BuildResponsesRequestFromChat(raw, s.webSearch)
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, err.Error())
 		return
@@ -215,6 +292,10 @@ func (s *Server) streamChatCompletions(w http.ResponseWriter, ctx context.Contex
 		switch event.Type {
 		case "response.output_text.delta":
 			return sendChunk([]any{openAIChatDeltaChoice(map[string]any{"content": stringValue(event.Data, "delta")}, nil)}, nil)
+		case "response.output_text.annotation.added":
+			if ann, ok := event.Data["annotation"]; ok && ann != nil {
+				return sendChunk([]any{openAIChatDeltaChoice(map[string]any{"annotations": []any{ann}}, nil)}, nil)
+			}
 		case "response.output_item.done":
 			item, _ := event.Data["item"].(map[string]any)
 			if stringValue(item, "type") != "function_call" {
@@ -340,6 +421,14 @@ func setSSEHeaders(header http.Header) {
 	header.Set("Cache-Control", "no-cache")
 	header.Set("Connection", "keep-alive")
 	header.Set("X-Accel-Buffering", "no")
+}
+
+// writeText is used by the compact formats: a widget or a chat client field wants one value,
+// not a JSON document.
+func writeText(w http.ResponseWriter, body string) {
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = io.WriteString(w, body+"\n")
 }
 
 func writeJSON(w http.ResponseWriter, status int, value any) {

@@ -13,9 +13,10 @@ import (
 )
 
 const (
-	defaultHost = "127.0.0.1"
-	defaultPort = 6769
-	apiKeyEnv   = "CODEX_PROXY_API_KEY"
+	defaultHost  = "127.0.0.1"
+	defaultPort  = 6769
+	apiKeyEnv    = "CODEX_PROXY_API_KEY"
+	webSearchEnv = "CODEX_PROXY_WEB_SEARCH"
 )
 
 type config struct {
@@ -23,6 +24,7 @@ type config struct {
 	port      int
 	codexHome string
 	apiKey    string
+	webSearch bool
 }
 
 func main() {
@@ -41,7 +43,13 @@ func run(args []string) error {
 	tokens := &TokenSource{codexHome: cfg.codexHome}
 	codex := &CodexClient{tokens: tokens}
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{}))
-	server := &Server{codex: codex, log: logger, apiKey: cfg.apiKey}
+	server := &Server{
+		codex:     codex,
+		log:       logger,
+		apiKey:    cfg.apiKey,
+		webSearch: cfg.webSearch,
+		usageTTL:  usageTTLFromEnv(),
+	}
 
 	addr := net.JoinHostPort(cfg.host, strconv.Itoa(cfg.port))
 	httpServer := &http.Server{
@@ -63,6 +71,7 @@ func parseFlags(args []string) (config, error) {
 	fs.IntVar(&cfg.port, "port", defaultPort, "port to listen on")
 	fs.StringVar(&cfg.codexHome, "codex-home", "", "Codex home directory; defaults to CODEX_HOME or ~/.codex")
 	fs.StringVar(&cfg.apiKey, "api-key", "", "API key required as Authorization bearer token; defaults to CODEX_PROXY_API_KEY")
+	fs.BoolVar(&cfg.webSearch, "web-search", false, "always enable web search tool for requests; defaults to CODEX_PROXY_WEB_SEARCH")
 
 	fs.Usage = func() {
 		fmt.Fprintf(fs.Output(), "Usage: codex-proxy [options]\n\nOptions:\n")
@@ -84,7 +93,21 @@ func parseFlags(args []string) (config, error) {
 	if cfg.apiKey == "" && !isLoopbackHost(cfg.host) {
 		return cfg, fmt.Errorf("refusing to listen on non-loopback host %q without --api-key or %s", cfg.host, apiKeyEnv)
 	}
+	if !cfg.webSearch {
+		if envVal := os.Getenv(webSearchEnv); envVal != "" {
+			cfg.webSearch = parseBoolEnv(envVal)
+		}
+	}
 	return cfg, nil
+}
+
+func parseBoolEnv(s string) bool {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
 }
 
 func isLoopbackHost(host string) bool {
