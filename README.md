@@ -111,6 +111,18 @@ go build -o codex-proxy .
 ./codex-proxy --port 6769
 ```
 
+`scripts/build.sh` wraps the same rebuild into one step and drops the binary at the repo root,
+which is where the MCPHub service entry points:
+
+```bash
+./scripts/build.sh          # -> ./codex-proxy
+OUT="$PREFIX/bin/codex-proxy" ./scripts/build.sh
+```
+
+The binary is git-ignored, so after every `git pull` run the script again before restarting the
+service. A service entry whose `command` points at a binary that was never built exits
+immediately and shows up as disconnected in MCPHub.
+
 ## Client configuration
 
 Most OpenAI-compatible clients can use:
