@@ -20,6 +20,8 @@ Changes on top of upstream, all in the maintenance of this fork:
 - `GET /v1/usage` reports the Codex quota windows, with a cached lookup that never delays a chat request.
 - `--web-search` / `CODEX_PROXY_WEB_SEARCH` force the web search tool on every request.
 - A wider `chat/completions` → Responses compatibility translation, with tests for the translator.
+- Image and audio attachments on `chat/completions` are forwarded as `input_image` / `input_audio`
+  parts instead of being dropped, as described in [Multimodal input](#multimodal-input).
 - Termux-friendly install and build notes, with the installer pointed at this fork.
 
 Bug reports against upstream behaviour are best checked against
@@ -177,6 +179,27 @@ curl http://127.0.0.1:6769/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{"model":"gpt-5.4-mini","stream":true,"messages":[{"role":"user","content":"Reply with exactly: pong"}]}'
 ```
+
+## Multimodal input
+
+`chat/completions` messages may carry images. The chat `image_url` part (either a `data:` URL or a
+public URL) is translated to the Responses `input_image` part, so the Codex backend actually sees
+the picture:
+
+```bash
+curl http://127.0.0.1:6769/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"gpt-5.5","messages":[{"role":"user","content":[
+        {"type":"text","text":"What is in this image?"},
+        {"type":"image_url","image_url":{"url":"data:image/png;base64,iVBORw0KGgo=","detail":"high"}}
+      ]}]}'
+```
+
+Chat audio parts (`input_audio` with `data`/`format`) are translated to `input_audio` / `audio_url`
+in the same way. The Codex backend has no file-attachment content type, so a `file` part is
+rejected with `HTTP 400` and an explicit message rather than being silently dropped: build the
+request with text, images and audio only. The `/v1/responses` route stays a pass-through, so it
+forwards whatever content parts the caller sends.
 
 Web search (Chat Completions):
 

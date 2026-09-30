@@ -123,7 +123,11 @@ func BuildResponsesRequestFromChat(raw map[string]any, opts ...bool) (map[string
 				instructions = append(instructions, text)
 			}
 		case "user":
-			input = append(input, map[string]any{"role": "user", "content": chatContentText(message["content"])})
+			content, err := chatMessageContent(message["content"])
+			if err != nil {
+				return nil, false, err
+			}
+			input = append(input, map[string]any{"role": "user", "content": content})
 		case "assistant":
 			if text := chatContentText(message["content"]); text != "" {
 				input = append(input, map[string]any{"role": "assistant", "content": text})
@@ -258,6 +262,103 @@ func chatContentText(content any) string {
 		b, _ := json.Marshal(v)
 		return string(b)
 	}
+}
+
+// chatMessageContent converts an OpenAI chat message's content into the shape the Codex
+// Responses backend accepts. Plain strings pass through, while structured content becomes
+// input_text, input_image and input_audio parts so images and audio are forwarded instead of
+// being silently dropped.
+func chatMessageContent(content any) (any, error) {
+	switch v := content.(type) {
+	case nil:
+		return "", nil
+	case string:
+		return v, nil
+	case []any:
+		parts := make([]any, 0, len(v))
+		for _, item := range v {
+			part, ok := item.(map[string]any)
+			if !ok {
+				return nil, errors.New("message content parts must be objects")
+			}
+			converted, err := responsesContentPart(part)
+			if err != nil {
+				return nil, err
+			}
+			parts = append(parts, converted)
+		}
+		if len(parts) == 0 {
+			return "", nil
+		}
+		return parts, nil
+	default:
+		b, _ := json.Marshal(v)
+		return nil, fmt.Errorf("unsupported message content %s", string(b))
+	}
+}
+
+// responsesContentPart maps one chat content part onto its Responses equivalent. The Codex
+// backend understands input_text, input_image (image_url + detail) and input_audio (audio_url);
+// anything else is rejected so a dropped attachment is never mistaken for an accepted one.
+func responsesContentPart(part map[string]any) (any, error) {
+	switch strings.ToLower(stringValue(part, "type")) {
+	case "", "text", "input_text":
+		return map[string]any{"type": "input_text", "text": stringValue(part, "text")}, nil
+	case "image_url", "image", "input_image":
+		url, detail := imagePartURL(part)
+		if url == "" {
+			return nil, errors.New("image content part is missing image_url")
+		}
+		out := map[string]any{"type": "input_image", "image_url": url}
+		if detail != "" {
+			out["detail"] = detail
+		}
+		return out, nil
+	case "input_audio", "audio":
+		url := audioPartURL(part)
+		if url == "" {
+			return nil, errors.New("audio content part is missing audio data")
+		}
+		return map[string]any{"type": "input_audio", "audio_url": url}, nil
+	default:
+		return nil, fmt.Errorf("unsupported message content type %q: the Codex backend accepts text, images and audio", stringValue(part, "type"))
+	}
+}
+
+func imagePartURL(part map[string]any) (string, string) {
+	detail := stringValue(part, "detail")
+	switch v := part["image_url"].(type) {
+	case string:
+		return v, detail
+	case map[string]any:
+		if nested := stringValue(v, "detail"); nested != "" {
+			detail = nested
+		}
+		return stringValue(v, "url"), detail
+	}
+	return stringValue(part, "url"), detail
+}
+
+func audioPartURL(part map[string]any) string {
+	if url := stringValue(part, "audio_url"); url != "" {
+		return url
+	}
+	for _, key := range []string{"input_audio", "audio"} {
+		nested, ok := part[key].(map[string]any)
+		if !ok {
+			continue
+		}
+		if url := stringValue(nested, "audio_url"); url != "" {
+			return url
+		}
+		if url := stringValue(nested, "url"); url != "" {
+			return url
+		}
+		if data := stringValue(nested, "data"); data != "" {
+			return "data:audio/" + defaultedString(nested, "format", "wav") + ";base64," + data
+		}
+	}
+	return ""
 }
 
 func responsesFunctionCallFromChat(toolCall any) map[string]any {

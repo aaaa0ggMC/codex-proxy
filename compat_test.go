@@ -1,6 +1,7 @@
 package main
 
 import (
+	"strings"
 	"testing"
 )
 
@@ -231,5 +232,155 @@ func TestBuildResponsesRequestFromChat_GlobalFlag(t *testing.T) {
 	}
 	if req2["tools"] != nil {
 		t.Errorf("expected nil tools when web_search_options is false, got %v", req2["tools"])
+	}
+}
+
+func userContent(t *testing.T, req map[string]any) any {
+	t.Helper()
+	input, ok := req["input"].([]any)
+	if !ok || len(input) != 1 {
+		t.Fatalf("expected 1 input item, got %v", req["input"])
+	}
+	message, ok := input[0].(map[string]any)
+	if !ok || message["role"] != "user" {
+		t.Fatalf("expected a user message, got %v", input[0])
+	}
+	return message["content"]
+}
+
+func contentPart(t *testing.T, content any, index int) map[string]any {
+	t.Helper()
+	parts, ok := content.([]any)
+	if !ok {
+		t.Fatalf("expected content parts, got %T (%v)", content, content)
+	}
+	if len(parts) <= index {
+		t.Fatalf("expected at least %d parts, got %v", index+1, parts)
+	}
+	part, ok := parts[index].(map[string]any)
+	if !ok {
+		t.Fatalf("expected a part object, got %T", parts[index])
+	}
+	return part
+}
+
+func TestBuildResponsesRequestFromChat_ImageAttachment(t *testing.T) {
+	dataURL := "data:image/png;base64,iVBORw0KGgo="
+	raw := map[string]any{
+		"model": "gpt-5.5",
+		"messages": []any{
+			map[string]any{"role": "user", "content": []any{
+				map[string]any{"type": "text", "text": "what is in this image?"},
+				map[string]any{"type": "image_url", "image_url": map[string]any{
+					"url":    dataURL,
+					"detail": "high",
+				}},
+			}},
+		},
+	}
+
+	req, _, err := BuildResponsesRequestFromChat(raw)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	content := userContent(t, req)
+	text := contentPart(t, content, 0)
+	if text["type"] != "input_text" || text["text"] != "what is in this image?" {
+		t.Errorf("unexpected text part: %v", text)
+	}
+	image := contentPart(t, content, 1)
+	if image["type"] != "input_image" {
+		t.Errorf("expected input_image, got %v", image["type"])
+	}
+	if image["image_url"] != dataURL {
+		t.Errorf("expected image data url to be preserved, got %v", image["image_url"])
+	}
+	if image["detail"] != "high" {
+		t.Errorf("expected detail high, got %v", image["detail"])
+	}
+}
+
+func TestBuildResponsesRequestFromChat_ImageURLString(t *testing.T) {
+	raw := map[string]any{
+		"model": "gpt-5.5",
+		"messages": []any{
+			map[string]any{"role": "user", "content": []any{
+				map[string]any{"type": "image_url", "image_url": "https://example.com/cat.png"},
+			}},
+		},
+	}
+
+	req, _, err := BuildResponsesRequestFromChat(raw)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	image := contentPart(t, userContent(t, req), 0)
+	if image["type"] != "input_image" || image["image_url"] != "https://example.com/cat.png" {
+		t.Errorf("unexpected image part: %v", image)
+	}
+}
+
+func TestBuildResponsesRequestFromChat_AudioAttachment(t *testing.T) {
+	raw := map[string]any{
+		"model": "gpt-5.5",
+		"messages": []any{
+			map[string]any{"role": "user", "content": []any{
+				map[string]any{"type": "input_audio", "input_audio": map[string]any{
+					"data":   "AQID",
+					"format": "mp3",
+				}},
+			}},
+		},
+	}
+
+	req, _, err := BuildResponsesRequestFromChat(raw)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	audio := contentPart(t, userContent(t, req), 0)
+	if audio["type"] != "input_audio" {
+		t.Errorf("expected input_audio, got %v", audio["type"])
+	}
+	if audio["audio_url"] != "data:audio/mp3;base64,AQID" {
+		t.Errorf("unexpected audio_url: %v", audio["audio_url"])
+	}
+}
+
+func TestBuildResponsesRequestFromChat_UnsupportedAttachment(t *testing.T) {
+	raw := map[string]any{
+		"model": "gpt-5.5",
+		"messages": []any{
+			map[string]any{"role": "user", "content": []any{
+				map[string]any{"type": "file", "file": map[string]any{"filename": "notes.pdf"}},
+			}},
+		},
+	}
+
+	_, _, err := BuildResponsesRequestFromChat(raw)
+	if err == nil {
+		t.Fatal("expected an error for an unsupported content type")
+	}
+	if !strings.Contains(err.Error(), "unsupported message content type") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestBuildResponsesRequestFromChat_PlainStringContent(t *testing.T) {
+	raw := map[string]any{
+		"model": "gpt-5.5",
+		"messages": []any{
+			map[string]any{"role": "user", "content": "hello"},
+		},
+	}
+
+	req, _, err := BuildResponsesRequestFromChat(raw)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if content := userContent(t, req); content != "hello" {
+		t.Errorf("expected content to stay a plain string, got %v", content)
 	}
 }
